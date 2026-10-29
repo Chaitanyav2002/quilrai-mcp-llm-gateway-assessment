@@ -5,12 +5,10 @@ import regex
 REDACTED = "[REDACTED]"
 
 PII = regex.compile(
-    # real card layouts only: 13-19 digits, 4-4-4-x groups, or 4-6-5 / 4-6-4 (Amex, Diners).
-    # A looser pattern pulls a stray digit in front of a card and then fails Luhn.
-    # \d is unicode aware here, so fullwidth digits are caught too
+    # card layouts: 13-19 digits, 4-4-4-x, or 4-6-5 / 4-6-4. \d also catches fullwidth digits
     r"(?P<card>(?<!\d)(?:\d{13,19}|\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}|\d{4}[ -]\d{6}[ -]\d{4,5})(?!\d))"
     r"|(?P<ssn>(?<!\d)\d{3}[- ]\d{2}[- ]\d{4}(?!\d))"
-    # lookbehind: only start at the beginning of a word, keeps long runs linear
+    # only start at the beginning of a word, otherwise long words get slow
     r"|(?P<email>(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})"
 )
 

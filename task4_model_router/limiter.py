@@ -44,8 +44,7 @@ class TokenRateLimiter:
             raise RequestTooLarge(f"request needs {tokens} tokens, the limit is {self.limit} per window")
         tenant, now = self._tenant(api_key), self.clock()
         with closing(self._connect()) as db:
-            # IMMEDIATE takes the write lock up front, so the check and the insert
-            # below cannot interleave with another request, even from another process
+            # IMMEDIATE locks before the read, so two requests (or processes) can't both pass the check
             db.execute("BEGIN IMMEDIATE")
             try:
                 db.execute("DELETE FROM usage WHERE ts <= ?", (now - self.window,))

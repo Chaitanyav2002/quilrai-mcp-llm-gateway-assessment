@@ -120,11 +120,15 @@ async def test_concurrent_requests_time_out_in_parallel(make):
     assert {r.headers["x-gateway-provider"] for r in responses} == {"secondary"}
 
 
+def connection_refused(request):
+    raise httpx.ConnectError("refused by 10.0.0.7")
+
+
 @pytest.mark.parametrize("failure", [
     lambda r: httpx.Response(500, text="Traceback (most recent call last): File /srv/model.py"),
     lambda r: httpx.Response(503),
     lambda r: httpx.Response(200, text="<html>proxy error</html>"),
-    lambda r: (_ for _ in ()).throw(httpx.ConnectError("refused by 10.0.0.7")),
+    connection_refused,
 ])
 async def test_other_primary_outages_also_fall_back(make, failure):
     client, _, _ = make(failure)
@@ -171,13 +175,14 @@ async def test_null_max_tokens_uses_the_default(make):
     assert response.status_code == 200
 
 
-async def test_odd_usage_field_does_not_break_a_good_answer(make):
-    odd = httpx.Response(200, json={"id": "cmpl-x", "choices": [], "usage": ["not", "a", "dict"]})
+@pytest.mark.parametrize("usage", [["not", "a", "dict"], {"total_tokens": True}, {"total_tokens": -5}])
+async def test_odd_usage_field_does_not_break_a_good_answer(make, usage):
+    odd = httpx.Response(200, json={"id": "cmpl-x", "choices": [], "usage": usage})
     client, _, limiter = make(lambda r: odd)
     response = await complete(client)
 
     assert response.status_code == 200
-    assert limiter.used("tenant-key-1") > 0  # the estimate stays charged
+    assert limiter.used("tenant-key-1") > 100  # the estimate stays charged
 
 
 async def test_usage_is_settled_to_what_the_provider_reports(make):
@@ -219,6 +224,7 @@ async def test_limit_is_per_api_key(make):
     ({"max_tokens": 10}, KEY, 400, "invalid_request"),
     ({**BODY, "max_tokens": 0}, KEY, 400, "invalid_request"),
     ({**BODY, "max_tokens": "200"}, KEY, 400, "invalid_request"),
+    ({**BODY, "max_tokens": True}, KEY, 400, "invalid_request"),
     ({**BODY, "stream": True}, KEY, 400, "invalid_request"),
     ({**BODY, "max_tokens": 60_000}, KEY, 400, "request_too_large"),
 ])

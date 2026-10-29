@@ -1,8 +1,8 @@
-# Task 4: Token rate limiter and model fallback router
+# Task 4: Token rate limiter and model fallback
 
-A model-routing module for an LLM gateway. Each tenant API key gets 50,000 tokens per minute, tracked in a sliding window in SQLite on disk. If the primary model answers `429` or takes longer than 3000 ms, the request goes to a backup provider. Every error comes back in one standard shape, with no upstream details.
+A routing module for an LLM gateway. Each tenant API key gets 50,000 tokens per minute, tracked in a sliding window in SQLite on disk. If the primary model answers 429 or takes longer than 3000 ms, the request goes to a backup provider. Every error comes back in one fixed shape with no upstream details.
 
-## Run it
+## Run
 
 ```bash
 MOCK_MODE=slow uvicorn task4_model_router.mock_provider:app --port 9201 &   # primary, answers after 5 s
@@ -15,50 +15,46 @@ uvicorn task4_model_router.app:app_from_env --factory --port 9200 &
 
 curl -si localhost:9200/v1/chat/completions -H "Authorization: Bearer tenant-a" \
   -H "Content-Type: application/json" -d '{"max_tokens":200,"messages":[{"role":"user","content":"hi"}]}'
-# HTTP 200 after about 3.0 s, X-Gateway-Provider: secondary
+# HTTP 200 after about 3 s, X-Gateway-Provider: secondary
 
-pytest task4_model_router -q    # 41 tests
+pytest task4_model_router -q    # 44 tests
 ```
 
-## Files
-
-| File | What it does |
+| File | Job |
 |---|---|
-| `limiter.py` | `TokenRateLimiter`: sliding window in SQLite with reserve, settle and release |
-| `router.py` | `ModelRouter`: reserves tokens, calls the primary with a 3 s deadline, falls back, settles real usage |
-| `app.py` | FastAPI endpoint: checks the key against `TENANT_API_KEYS`, validates the body, turns every failure into the standard error |
+| `limiter.py` | `TokenRateLimiter`: the sliding window in SQLite (reserve, settle, release) |
+| `router.py` | `ModelRouter`: reserve tokens, call the primary with a 3 s deadline, fall back, record real usage |
+| `app.py` | The HTTP endpoint: checks the key, validates the body, turns every failure into the standard error |
 
 ## Rate limiting
 
-Only keys listed in `TENANT_API_KEYS` are accepted. Otherwise any new string would be a fresh 50k budget on the gateway's own provider keys.
+Only keys listed in `TENANT_API_KEYS` are accepted. Without that list, any new string would be a fresh 50k budget on the gateway's own provider keys.
 
-Each request is one row in `usage(tenant, ts, tokens)`. The tenant is the SHA-256 of the API key, so raw keys never touch the disk.
+Each request is one row in `usage(tenant, ts, tokens)`. The tenant is a SHA-256 of the API key, so raw keys are never written to disk.
 
-1. **Reserve** before calling any model. The estimate is the prompt size (about 4 characters per token) plus `max_tokens` (default 1024), which is the most the request can cost.
-2. In one `BEGIN IMMEDIATE` transaction: delete rows older than 60 s (eviction), add up the tenant's remaining rows, and insert the new row only if it fits. Otherwise return `429` with a `Retry-After` header that says when enough old usage will have left the window.
-3. **Settle** once the provider answers: the row is changed to `usage.total_tokens`. A request that reserved 1,224 tokens but used 20 frees the difference straight away.
-4. **Release** the row if both providers fail, so the tenant is not charged for an outage.
+1. **Reserve** before calling a model. The estimate is the prompt size (about 4 characters per token) plus `max_tokens` (1024 if not set), which is the most the request can cost.
+2. In one `BEGIN IMMEDIATE` transaction: delete rows older than 60 s, add up the tenant's remaining tokens, and insert the new row only if it fits. If it doesn't, return 429 with a `Retry-After` that says when enough old usage will have dropped out.
+3. **Settle** when the model answers: the row is updated to the real `usage.total_tokens`, so a request that reserved 1,224 tokens but used 20 gives the rest back right away.
+4. **Release** the row if both providers fail, so the tenant isn't charged for an outage.
 
-**Why `BEGIN IMMEDIATE`.** Two requests must not both read "45,000 used" and both add 5,000. `IMMEDIATE` takes SQLite's write lock before the read, so the check and the insert act as one step. The lock lives in the database file, so this holds across several gateway processes sharing the file, not just across coroutines in one process. The test runs 40 reservations of 5k from 16 threads through 4 separate limiter objects, and exactly 10 succeed.
+`BEGIN IMMEDIATE` takes the write lock before the read, so two requests can't both see "45,000 used" and both add 5,000. The lock is in the database file, which means this also works with several gateway processes sharing it. The test fires 40 requests of 5k from 16 threads through 4 separate limiters, and exactly 10 get through.
 
-**Why rows instead of a counter.** A fixed-window counter lets a tenant spend 50k at 0:59 and another 50k at 1:01. Rows give an exact sliding window, and the window only ever holds one minute of a tenant's requests, so the table stays small.
+I store one row per request rather than a counter per minute. A per-minute counter lets a tenant spend 50k at 0:59 and another 50k at 1:01.
 
-The sqlite calls are blocking, so the router runs them with `asyncio.to_thread` to keep the event loop free while it waits on the database.
+The SQLite calls block, so the router runs them in a thread (`asyncio.to_thread`) and the event loop stays free.
 
 ## Fallback
 
 | Primary result | What happens |
 |---|---|
 | 200 with a JSON object | Returned, `X-Gateway-Provider: primary` |
-| 429, or no answer within 3000 ms | Fall back to the secondary (the task's two cases) |
-| 5xx, 401/403/404, connection error, reply that is not JSON | Also fall back: the primary is down or misconfigured, which is not the client's fault |
-| 400 or 422 (the request itself is bad) | **No** fallback: the backup would reject it too. Returned as `upstream_rejected_request` |
+| 429, or no answer in 3000 ms | Go to the backup (the two cases in the task) |
+| 5xx, 401/403/404, connection error, a reply that isn't JSON | Also go to the backup: the primary is down or misconfigured, which isn't the client's fault |
+| 400 or 422 | No fallback. The request itself is bad and the backup would refuse it too. |
 
-**The timeout race.** The primary call runs inside `asyncio.timeout(3.0)`. At the deadline the request is *cancelled*, not just ignored, so a reply that arrives at 3.1 s can never be used or counted alongside the secondary's. The test checks that the slow handler actually receives the cancellation, and that 10 concurrent requests with a slow primary all finish in about 0.3 s total (the test timeout) rather than one after another. The secondary has its own timeout (10 s by default) so it cannot hang a request either.
+The primary call runs inside `asyncio.timeout(3.0)`. At the deadline the request is cancelled, not just ignored, so a reply that turns up at 3.1 s can never be used or counted twice. The backup has its own timeout (10 s by default) so it can't hang a request either. It can also use a different model name (`SECONDARY_MODEL`).
 
-The backup can take a different model name (`SECONDARY_MODEL`), since a backup provider rarely serves the same model.
-
-## Error payload
+## Errors
 
 Every failure, including unexpected bugs, looks like this:
 
@@ -67,22 +63,22 @@ Every failure, including unexpected bugs, looks like this:
            "message": "All model providers are unavailable, please retry", "request_id": "3f9c0a1b2d4e5f60"}}
 ```
 
-Codes: `missing_api_key` / `invalid_api_key` (401), `invalid_request` (400), `request_too_large` (400 over the token limit, 413 over 1 MB), `rate_limited` (429 + `Retry-After`), `upstream_rejected_request` (400/502), `providers_unavailable` (503), `internal_error` (500).
+Codes: `missing_api_key` / `invalid_api_key` (401), `invalid_request` (400), `request_too_large` (400 over the token limit, 413 over 1 MB), `rate_limited` (429 + `Retry-After`), `upstream_rejected_request` (400), `providers_unavailable` (503), `internal_error` (500).
 
-Upstream bodies, tracebacks and exception text are never sent to the client. They go to the server log next to the same `request_id`, so a support ticket can be traced. The tests feed real-looking Python tracebacks and internal paths through the providers and through a crashing limiter, and check that none of it reaches the response.
+Upstream error bodies, tracebacks and exception text never reach the client. They go to the server log with the same `request_id`, so a support ticket can be traced.
 
-## Tests and what they prove
+## Tests
 
-- Window maths: sliding, eviction (the expired row is deleted, not just skipped), `Retry-After` accuracy, settle, release, per-tenant isolation, survival across a restart, no raw keys on disk.
-- Concurrency: no overshoot with many threads and processes-style separate connections.
-- Fallback on 429, timeout, 5xx, connection errors and garbage replies, and no fallback on a 400.
-- The slow primary is cancelled at the deadline, and concurrent requests time out in parallel.
-- Every error matches the standard shape and leaks nothing.
-- I broke the code eight ways to make sure the tests can fail: no transaction, no eviction, no refund, no settle, no timeout, failing over on any error, leaking the upstream text, and a deferred `BEGIN`. All but the last made the matching tests fail. A deferred `BEGIN` happens to be safe here only because the first statement is a write; `IMMEDIATE` keeps it safe if the statements are ever reordered.
+- The window itself: sliding, expired rows actually deleted, correct `Retry-After`, settle, release, separate tenants, surviving a restart, no raw keys on disk.
+- No overshoot when many threads reserve at once.
+- Fallback on 429, timeout, 5xx, 401/403/404, connection errors and bad replies, and no fallback on 400.
+- A slow primary really is cancelled at the deadline, and 10 concurrent requests time out together rather than one after another.
+- Every error has the standard shape, and fake tracebacks and internal paths from upstream never show up in it.
+- I broke the code on purpose (no transaction, no eviction, no refund, no settle, no timeout, falling back on every error, leaking upstream text), and each change failed a test. A deferred `BEGIN` happened to pass, but only because the first statement is a write. `IMMEDIATE` keeps it safe if someone reorders the statements.
 
 ## Not included
 
-- Token counts are estimated at about 4 characters per token. A real deployment would use the model's tokenizer (for example `tiktoken`). Settling to the provider's real `usage` keeps the window accurate either way.
-- A request can still go over the limit after the fact, if the model writes more than the estimate allowed for. The extra usage counts against the next minute.
-- Non-streaming only. A streaming version would settle when the final usage chunk arrives.
-- No circuit breaker. After repeated primary failures, a breaker would skip straight to the secondary instead of waiting 3 s each time.
+- Tokens are estimated at about 4 characters each. A real setup would use the model's tokenizer. Recording the provider's real usage keeps the window accurate either way.
+- A request can still go over after the fact if the model writes more than estimated. The extra counts against the next minute.
+- Non-streaming only. A streaming version would record usage when the final usage chunk arrives.
+- No circuit breaker. After many primary failures, a breaker would go straight to the backup instead of waiting 3 s each time.

@@ -23,7 +23,8 @@ log = logging.getLogger("customer-mcp")
 MAX_REFUND = 10_000  # assumed per-refund cap, bigger refunds need a person
 
 # [0-9] not \d, \d also matches digits like "١"
-CustomerId = Annotated[str, StringConstraints(pattern=r"^CUST-[0-9]{5}$")]
+CustomerId = Annotated[str, StringConstraints(pattern=r"^CUST-[0-9]{5}$"),
+                       Field(description="Customer id: CUST- and 5 digits, e.g. CUST-12345")]
 
 
 class StrictArgs(BaseModel):
@@ -32,16 +33,15 @@ class StrictArgs(BaseModel):
 
 
 class GetCustomerRecordArgs(StrictArgs):
-    customer_id: CustomerId = Field(description="Customer id in the form CUST-XXXXX (5 digits).")
+    customer_id: CustomerId
 
 
 class TriggerRefundArgs(StrictArgs):
-    customer_id: CustomerId = Field(description="Customer id in the form CUST-XXXXX (5 digits).")
+    customer_id: CustomerId
     amount: float = Field(gt=0, le=MAX_REFUND, allow_inf_nan=False,
-                          description=f"Refund amount, more than 0 and at most {MAX_REFUND}, up to 2 decimal places.")
+                          description=f"Above 0, at most {MAX_REFUND}, up to 2 decimal places")
     reason: Annotated[str, StringConstraints(strip_whitespace=True, min_length=10, max_length=500)] = Field(
-        description="Why the refund is issued, at least 10 characters."
-    )
+        description="Why the refund is issued, at least 10 characters")
 
     @field_validator("amount")
     @classmethod
@@ -139,6 +139,7 @@ class AnswerUnreadableLines:
         # the SDK reads attributes like last_context from the stream
         return getattr(self._inner, name)
 
+    # the SDK uses async for today; receive() is kept so a future caller can't skip the check
     async def receive(self):
         return await self._next(self._inner.receive)
 

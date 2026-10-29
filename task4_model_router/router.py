@@ -64,7 +64,7 @@ class ModelRouter:
 
         usage = data.get("usage")
         used = usage.get("total_tokens") if isinstance(usage, dict) else None
-        if isinstance(used, int) and not isinstance(used, bool) and used >= 0:
+        if type(used) is int and used >= 0:
             await asyncio.to_thread(self.limiter.settle, reservation, used)
         return data, name
 

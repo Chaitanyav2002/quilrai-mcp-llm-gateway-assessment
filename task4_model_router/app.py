@@ -59,7 +59,7 @@ async def read_body(request: Request) -> dict:
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         raise invalid("Request must be a JSON object with a messages list")
     max_tokens = body.get("max_tokens")
-    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1):
+    if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 1):
         raise invalid("max_tokens must be a positive integer")
     if body.get("stream"):
         raise invalid("Streaming is not supported on this endpoint")

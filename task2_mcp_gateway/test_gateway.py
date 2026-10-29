@@ -236,6 +236,7 @@ async def test_bearer_scheme_is_case_insensitive(gateway):
     ('{"jsonrpc": "1.0", "id": 1, "method": "ping"}', -32600),
     ('{"jsonrpc": "2.0", "id": 1, "method": 5}', -32600),
     ('{"jsonrpc": "2.0", "id": {"nested": 1}, "method": "ping"}', -32600),
+    ('{"jsonrpc": "2.0", "id": true, "method": "ping"}', -32600),
 ])
 async def test_malformed_json_rpc_is_rejected_before_forwarding(gateway, downstream, body, code):
     response = await post(gateway, body)

@@ -14,7 +14,7 @@ Four tasks on MCP servers, MCP and LLM gateways, stream guardrails and model rou
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q          # 185 tests across all four tasks
+pytest -q          # 194 tests across all four tasks
 ```
 
 Each task folder shows how to run its servers by hand. Configuration comes from environment variables; see [`.env.example`](.env.example). No secrets are stored in the repo.

@@ -41,12 +41,20 @@ def events_from(lines):
     return [line[len("data: "):] for line in lines if line.startswith("data: ")]
 
 
-def content_of(events):
+def text_of(events, field="content", index=None):
+    """Joins one text field across events. field is content, refusal or arguments."""
     text = ""
     for data in events:
-        if data != "[DONE]":
-            for choice in json.loads(data)["choices"]:
-                text += (choice.get("delta") or {}).get("content") or ""
+        if data == "[DONE]":
+            continue
+        for choice in json.loads(data)["choices"]:
+            if index is not None and choice["index"] != index:
+                continue
+            delta = choice.get("delta") or {}
+            if field == "arguments":
+                text += "".join(call["function"].get("arguments", "") for call in delta.get("tool_calls", []))
+            else:
+                text += delta.get(field) or ""
     return text
 
 
@@ -64,7 +72,7 @@ async def test_stream_comes_back_redacted():
                 assert response.headers["content-type"].startswith("text/event-stream")
                 events = events_from([line async for line in response.aiter_lines()])
 
-    assert content_of(events) == EXPECTED
+    assert text_of(events) == EXPECTED
     assert events[-1] == "[DONE]"
     finish = [i for i, e in enumerate(events[:-1]) if json.loads(e)["choices"][0]["finish_reason"]]
     assert finish == [len(events) - 2]  # nothing sent after the finish chunk
@@ -80,7 +88,7 @@ async def test_first_text_arrives_long_before_the_stream_ends():
             first_text = None
             async with client.stream("POST", f"{url}/v1/chat/completions", json=REQUEST) as response:
                 async for line in response.aiter_lines():
-                    if first_text is None and line.startswith("data: {") and content_of([line[6:]]):
+                    if first_text is None and line.startswith("data: {") and text_of([line[6:]]):
                         first_text = time.perf_counter() - start
             total = time.perf_counter() - start
 
@@ -90,66 +98,87 @@ async def test_first_text_arrives_long_before_the_stream_ends():
 
 # the stream transform
 
-def chunk(content=None, index=0, finish=None):
-    delta = {} if content is None else {"content": content}
+def chunk(delta=None, index=0, finish=None):
     return "data: " + json.dumps({"id": "c1", "model": "m", "choices": [
-        {"index": index, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+        {"index": index, "delta": delta or {}, "finish_reason": finish}]}) + "\n\n"
+
+
+def tool_args(arguments):
+    return {"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]}
+
+
+async def transform(*raw):
+    out = "".join([e async for e in redact_stream(lines_of(*raw))])
+    return events_from(out.split("\n"))
 
 
 async def test_each_choice_is_redacted_on_its_own():
-    lines = lines_of(chunk("mail a@b", 0), chunk("call 123-45", 1), chunk(".com", 0), chunk("-6789", 1),
-                     chunk(index=0, finish="stop"), chunk(index=1, finish="stop"), "data: [DONE]\n\n")
-    events = [e async for e in redact_stream(lines)]
+    events = await transform(
+        chunk({"content": "mail a@b"}, 0), chunk({"content": "call 123-45"}, 1),
+        chunk({"content": ".com"}, 0), chunk({"content": "-6789"}, 1),
+        chunk(index=0, finish="stop"), chunk(index=1, finish="stop"), "data: [DONE]\n\n")
 
-    per_choice = {0: "", 1: ""}
-    for data in events_from("".join(events).split("\n")):
-        if data != "[DONE]":
-            for choice in json.loads(data)["choices"]:
-                per_choice[choice["index"]] += choice["delta"].get("content", "")
-    assert per_choice == {0: "mail [REDACTED]", 1: "call [REDACTED]"}
+    assert text_of(events, index=0) == "mail [REDACTED]"
+    assert text_of(events, index=1) == "call [REDACTED]"
 
 
 async def test_finish_chunk_with_null_content_still_flushes():
-    raw = chunk("mail a@b.co") + 'data: {"id": "c1", "choices": [{"index": 0, "delta": {"content": null}, "finish_reason": "stop"}]}\n\n'
-    events = events_from("".join([e async for e in redact_stream(lines_of(raw, "data: [DONE]\n\n"))]).split("\n"))
+    events = await transform(chunk({"content": "mail a@b.co"}), chunk({"content": None}, finish="stop"),
+                             "data: [DONE]\n\n")
 
-    assert content_of(events) == "mail [REDACTED]"
+    assert text_of(events) == "mail [REDACTED]"
     assert events[-1] == "[DONE]"
 
 
 async def test_tool_call_arguments_and_refusals_are_redacted_too():
-    def tool_chunk(arguments, finish=None):
-        delta = {"tool_calls": [{"index": 0, "function": {"arguments": arguments}}]}
-        return "data: " + json.dumps({"id": "c1", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}) + "\n\n"
+    events = await transform(
+        chunk(tool_args('{"to": "jane@cor')), chunk(tool_args('p.com", "ssn": "123-45-')), chunk(tool_args('6789"}')),
+        chunk({"refusal": "I won't email bob@x.io"}, finish="stop"))
 
-    raw = [tool_chunk('{"to": "jane@cor'), tool_chunk('p.com", "ssn": "123-45-'), tool_chunk('6789"}'),
-           "data: " + json.dumps({"id": "c1", "choices": [{"index": 0, "delta": {"refusal": "I won't email bob@x.io"},
-                                                           "finish_reason": "stop"}]}) + "\n\n"]
-    out = "".join([e async for e in redact_stream(lines_of(*raw))])
+    assert text_of(events, "arguments") == '{"to": "[REDACTED]", "ssn": "[REDACTED]"}'
+    assert text_of(events, "refusal") == "I won't email [REDACTED]"
 
-    arguments = refusal = ""
-    for data in events_from(out.split("\n")):
-        delta = json.loads(data)["choices"][0]["delta"]
-        for call in delta.get("tool_calls", []):
-            arguments += call["function"].get("arguments", "")
-        refusal += delta.get("refusal") or ""
-    assert arguments == '{"to": "[REDACTED]", "ssn": "[REDACTED]"}'
-    assert refusal == "I won't email [REDACTED]"
+
+@pytest.mark.parametrize("ending", [[chunk(index=0, finish="tool_calls")], []])
+async def test_tool_arguments_held_at_the_end_keep_their_call_index(ending):
+    call = {"tool_calls": [{"index": 2, "function": {"arguments": '{"to": "bob@x.io'}}]}
+    events = await transform(chunk(call), *ending)
+
+    assert text_of(events, "arguments") == '{"to": "[REDACTED]'
+    indexes = {c["index"] for e in events for c in json.loads(e)["choices"][0]["delta"].get("tool_calls", [])}
+    assert indexes == {2}
+
+
+async def test_finish_chunk_tool_text_is_merged_into_its_own_entry():
+    # some clients don't merge two entries with the same index inside one chunk
+    last = {"tool_calls": [{"index": 0, "id": "call_1", "function": {"name": "f", "arguments": '{"to": "bob@x.io'}}]}
+    events = await transform(chunk(last, finish="tool_calls"))
+
+    calls = json.loads(events[-1])["choices"][0]["delta"]["tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["function"]["arguments"] == '{"to": "[REDACTED]'
+
+
+async def test_odd_tool_index_cannot_mix_with_content():
+    delta = {"content": "hi a@b.co", "tool_calls": [{"index": "content", "function": {"arguments": "x@y.co"}}]}
+    events = await transform(chunk(delta, finish="stop"))
+
+    assert text_of(events) == "hi [REDACTED]"
+    assert text_of(events, "arguments") == "[REDACTED]"
 
 
 async def test_held_text_is_not_lost_when_the_stream_stops_early():
-    lines = lines_of(chunk("reach me at jane@example.org"))
-    events = events_from("".join([e async for e in redact_stream(lines)]).split("\n"))
+    events = await transform(chunk({"content": "reach me at jane@example.org"}))
 
-    assert content_of(events) == "reach me at [REDACTED]"
+    assert text_of(events) == "reach me at [REDACTED]"
     assert "[DONE]" not in events
 
 
 async def test_sse_comments_and_multiline_data_are_handled():
-    raw = ': keep-alive\n\ndata: {"id": "c1", "choices": [{"index": 0,\ndata: "delta": {"content": "hi"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n'
-    events = events_from("".join([e async for e in redact_stream(lines_of(raw))]).split("\n"))
+    events = await transform(': keep-alive\n\ndata: {"id": "c1", "choices": [{"index": 0,\n'
+                             'data: "delta": {"content": "hi"}, "finish_reason": "stop"}]}\n\ndata: [DONE]\n\n')
 
-    assert content_of(events) == "hi"
+    assert text_of(events) == "hi"
 
 
 # errors

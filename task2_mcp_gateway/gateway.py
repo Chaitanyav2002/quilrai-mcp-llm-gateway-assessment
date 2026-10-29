@@ -44,8 +44,7 @@ class DuplicateKey(ValueError):
 
 
 def reject_duplicate_keys(pairs):
-    # we forward the original bytes, so a parser that keeps the first duplicate
-    # downstream must not see a different call than the one we checked
+    # we forward the raw bytes, and a parser that keeps the first duplicate would see another call
     obj = dict(pairs)
     if len(obj) != len(pairs):
         raise DuplicateKey("duplicate key in JSON object")
@@ -77,8 +76,7 @@ def envelope_problem(message: Any) -> str | None:
         return "Batch requests are not supported"
     if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
         return "Invalid Request"
-    request_id = message.get("id")
-    if "id" in message and (isinstance(request_id, bool) or not isinstance(request_id, (str, int))):
+    if "id" in message and type(message["id"]) not in (str, int):
         return "Invalid Request: id must be a string or an integer"
     if "method" in message:
         return None if isinstance(message["method"], str) else "Invalid Request: method must be a string"
@@ -151,12 +149,12 @@ def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncCli
             # GET (SSE stream) and DELETE (end session) have no body to check
             return await forward(request, b"")
 
-        body = bytearray()
+        raw = bytearray()
         async for part in request.stream():
-            body += part
-            if len(body) > MAX_BODY:
+            raw += part
+            if len(raw) > MAX_BODY:
                 return json_rpc_error(None, INVALID_REQUEST, "Request body too large", status=413)
-        body = bytes(body)
+        body = bytes(raw)
         try:
             message = json.loads(body, object_pairs_hook=reject_duplicate_keys)
         except DuplicateKey:

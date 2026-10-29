@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+import anyio
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,9 @@ async def test_lists_both_tools_with_their_constraints(session):
     assert refund["properties"]["reason"]["minLength"] == 10
     assert refund["properties"]["amount"]["exclusiveMinimum"] == 0
     assert refund["additionalProperties"] is False
+    for tool in tools.values():
+        for name, prop in tool["inputSchema"]["properties"].items():
+            assert prop.get("description"), f"{name} has no description for the model"
 
 
 async def test_get_customer_record_returns_the_record(session):
@@ -229,6 +233,19 @@ async def test_unknown_tool_is_invalid_params(session):
     reply = await session.call_tool("delete_customer", {"customer_id": "CUST-10001"})
 
     assert error_code(reply) == INVALID_PARAMS
+
+
+async def test_wrapper_also_answers_bad_lines_on_receive():
+    from task1_mcp_server.server import AnswerUnreadableLines
+    send_in, recv_in = anyio.create_memory_object_stream(10)
+    send_out, recv_out = anyio.create_memory_object_stream(10)
+    await send_in.send(ValueError("not a JSON-RPC message"))
+    await send_in.send("next message")
+
+    reader = AnswerUnreadableLines(recv_in, send_out)
+
+    assert await reader.receive() == "next message"
+    assert recv_out.receive_nowait().message.error.code == -32600
 
 
 # stdio isolation

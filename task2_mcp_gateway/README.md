@@ -1,12 +1,12 @@
-# Task 2: MCP security gateway (auth and tool filtering)
+# Task 2: MCP security gateway
 
-A reverse proxy (FastAPI + httpx) that sits between an AI agent and a downstream MCP server. It reads the role from a bearer JWT and blocks `admin_*` tool calls for anyone who is not an admin. A blocked call never reaches the downstream server.
+A reverse proxy (FastAPI + httpx) between an AI agent and a downstream MCP server. It reads the caller's role from a bearer JWT and blocks `admin_*` tool calls for anyone who is not an admin. A blocked call never reaches the MCP server.
 
 ```
-agent --(Bearer JWT)--> gateway :9000 /mcp --(original bytes, no token)--> MCP server :9001 /mcp
+agent --(Bearer JWT)--> gateway :9000 /mcp --(same bytes, no token)--> MCP server :9001 /mcp
 ```
 
-## Run it
+## Run
 
 ```bash
 export GATEWAY_JWT_SECRET="$(openssl rand -hex 32)"
@@ -20,51 +20,42 @@ curl -s localhost:9000/mcp -H "Authorization: Bearer $VIEWER" -H "Content-Type: 
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"admin_reset_key","arguments":{}}}'
 # {"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Unauthorized Tool Call"}}
 
-pytest task2_mcp_gateway -q    # 47 tests
+pytest task2_mcp_gateway -q    # 48 tests
 ```
 
-## Request flow
+## What happens to a request
 
-| Step | Check | On failure |
-|---|---|---|
-| 1. Authenticate | `Authorization: Bearer <jwt>`, HS256 only, signature valid, `exp` present and not expired, `role` is `"admin"` or `"viewer"` | HTTP 401, `WWW-Authenticate: Bearer`, JSON-RPC error `-32000`. Nothing is forwarded. |
-| 2. Parse | Body is at most 1 MB, is JSON with no duplicate keys, and is a single JSON-RPC 2.0 message (string or integer `id`, string `method`) | HTTP 413 if too large; HTTP 400 with `-32700` (not JSON) or `-32600` (duplicate keys, bad envelope, batch), `id: null` |
-| 3. Authorize | `tools/call` with a `params.name` starting with `admin_` needs role `admin` | HTTP 200, `{"code": -32001, "message": "Unauthorized Tool Call"}` with the request's `id` |
-| 4. Forward | Everything else, `tools/list` included | The downstream response is streamed back as is (JSON or SSE) |
-| | Downstream unreachable or timed out | HTTP 502 or 504, `-32603`, with no internal addresses in the body |
+1. **Auth.** The token must be an HS256 JWT signed with our secret, with `exp` and a `role` of `admin` or `viewer`. Otherwise the caller gets HTTP 401 and nothing else.
+2. **Parse.** The body must be under 1 MB, valid JSON with no duplicate keys, and a single JSON-RPC 2.0 message. Otherwise: 413, or 400 with `-32700` / `-32600`.
+3. **Authorize.** A `tools/call` whose `params.name` starts with `admin_` needs the admin role. Anyone else gets `-32001 Unauthorized Tool Call` with their request `id`.
+4. **Forward.** Everything else, `tools/list` included, goes to the MCP server unchanged, and the reply (JSON or SSE) is streamed back. If the server is down: 502, or 504 on a timeout.
 
-The order is deliberate: an unauthenticated caller learns nothing about which tools exist or how the gateway parses requests.
+Auth comes first so an unauthenticated caller learns nothing about the tools.
 
-## Design decisions
+## Decisions
 
-**JWT, verified and pinned.** The role comes from a signed claim, so a client cannot simply claim to be an admin. `algorithms=["HS256"]` is pinned, so `alg: none` and algorithm-swap tokens fail. `exp` is required, the role must be a string from a known set (a list such as `["admin"]` is rejected), and the app refuses to start with a secret shorter than 32 bytes. The secret comes from an environment variable and is never in the repo.
+- The JWT algorithm is pinned to HS256, so `alg: none` tokens fail. The role must be a known string, so a list like `["admin"]` is rejected. The secret comes from the environment, and the app won't start with one shorter than 32 bytes.
+- The `admin_` check ignores case. MCP tool names are case sensitive, but if the server ever normalized names, `ADMIN_reset_key` would turn into a working admin tool.
+- `get_admin_contact` is allowed. The rule is "starts with `admin_`", not "contains admin".
+- Things that are refused rather than forwarded:
+  - A `tools/call` without a readable string name (`-32602`), since there's no way to authorize it.
+  - A `tools/call` with no `id`.
+  - JSON-RPC batches. MCP dropped them in the 2025-06-18 spec, and an admin call could hide inside one.
+  - Duplicate keys. The gateway forwards the original bytes, and Python keeps the last duplicate while some parsers keep the first, so `{"name":"admin_reset_key","name":"get_weather"}` would pass the check here and run the admin tool downstream. The code review found this.
+- The user's token is not forwarded. Passing it on would let the MCP server replay it somewhere else. In production the gateway would use its own credential with the server.
+- MCP headers such as `Mcp-Session-Id` pass through both ways. `GET` (the notification stream) and `DELETE` (end session) are forwarded after auth, and the `GET` stream has no read timeout because it can be idle for minutes.
+- Every forwarded call and every denial is logged with the token's `sub` and role. The token itself is never logged.
 
-**Fail closed on anything ambiguous.**
-- The `admin_` check ignores case. MCP tool names are case sensitive, but if the downstream server ever normalized case, `ADMIN_reset_key` would become a working admin tool.
-- A `tools/call` without a readable string `params.name` is refused with `-32602`. A call the gateway cannot read is a call it cannot authorize.
-- A `tools/call` sent as a notification (no `id`) is refused, since there would be nowhere to send the denial.
-- JSON-RPC batches are refused. MCP removed batching in the 2025-06-18 revision, and refusing outright means an admin call cannot be hidden inside a batch next to an allowed one.
-- Duplicate keys are refused. The gateway forwards the original bytes, and Python keeps the *last* duplicate while some parsers keep the *first*, so `{"name":"admin_reset_key","name":"get_weather"}` would look harmless here and run the admin tool downstream. The code review caught this one.
+## Tests
 
-**The prefix check is exact on purpose.** `get_admin_contact` is allowed. The rule is "starts with `admin_`", not "contains admin".
-
-**Transparent forwarding.** The original request bytes are forwarded unchanged rather than re-serialized, so the downstream server sees exactly what the client sent. MCP headers such as `Mcp-Session-Id` and `Mcp-Protocol-Version` pass through both ways. The response is streamed with `aiter_raw()`, so a streamable HTTP server's SSE replies work, and `GET`/`DELETE /mcp` (the SSE stream and session end) are forwarded after authentication. The `GET` notification stream has no read timeout, because it can sit idle for minutes.
-
-**The user's token stops at the gateway.** `Authorization`, cookies and hop-by-hop headers are not forwarded. Passing a client token through to a downstream server is a known MCP anti-pattern: the server could replay it elsewhere. In production the gateway would authenticate to the downstream server with its own credential.
-
-**Audit trail.** Every forwarded call and every denial is logged with the token's `sub` and role (quoted, so a tool name with a newline cannot fake a log line). The token itself is never logged.
-
-## Tests and what they prove
-
-- `tools/list` arrives downstream byte for byte, and the response comes back unchanged.
-- A viewer calling `admin_reset_key`, `ADMIN_reset_key` or `Admin_delete_user` gets the exact `-32001` response, **and the mock server records zero requests**.
-- An admin's call goes through, and `get_admin_contact` is not blocked by mistake.
-- 14 bad-token cases (missing, wrong scheme, garbage, wrong key, expired, no `exp`, no role, unknown role, role as a list, `alg: none`, HS512) all get 401.
-- Malformed bodies, batches, duplicate keys, bodies over 1 MB and unreadable `tools/call` names are rejected without being forwarded.
-- `GET` and `DELETE` need a token too, and the token is never forwarded.
-- I checked that the tests are meaningful by breaking the gateway five ways (case-sensitive prefix, accepting HS512, forwarding `Authorization`, no role type check, no admin check). Each change made the matching tests fail.
+- `tools/list` reaches the server byte for byte, and the reply comes back unchanged.
+- A viewer calling `admin_reset_key`, `ADMIN_reset_key` or `Admin_delete_user` gets the exact `-32001` error, and the mock server records zero requests.
+- Admins get through, and `get_admin_contact` is not blocked by mistake.
+- 14 bad-token cases get 401: missing, wrong scheme, wrong key, expired, no role, `alg: none`, HS512 and so on.
+- Bad JSON, batches, duplicate keys, oversized bodies and unreadable tool names never reach the server.
+- I broke the gateway five ways (case-sensitive check, accepting HS512, forwarding the token, no role type check, no admin check) and each one failed a test.
 
 ## Not included
 
-- **`tools/list` is not filtered.** The task says to forward it transparently. Hiding admin tools from viewers would be an easy next step, and good for the model's context, but the call check is the real security boundary either way.
-- Token issuing, key rotation and a real identity provider (it would use RS256/JWKS rather than a shared secret).
+- `tools/list` is not filtered, because the task says to forward it as is. Hiding admin tools from viewers would be an easy addition, but the check on calls is what actually protects them.
+- Issuing tokens. A real setup would use an identity provider and RS256 keys instead of a shared secret.

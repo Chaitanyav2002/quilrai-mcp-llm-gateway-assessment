@@ -43,26 +43,28 @@ async def sse_data(lines: AsyncIterator[str]) -> AsyncIterator[str]:
 
 
 def text_fields(delta: dict):
-    """Every text field in a delta that can carry PII, as (field, holder, key)."""
+    """Text in a delta that can carry PII: content, refusal and tool call arguments.
+
+    Yields (field, holder, key). field is "content", "refusal" or ("tool", index).
+    """
     yield "content", delta, "content"
     yield "refusal", delta, "refusal"
     for call in delta.get("tool_calls") or []:
-        function = call.get("function") if isinstance(call, dict) else None
-        if isinstance(function, dict):
-            yield ("tool", call.get("index", 0)), function, "arguments"
+        if isinstance(call, dict) and isinstance(call.get("function"), dict):
+            yield ("tool", call.get("index", 0)), call["function"], "arguments"
 
 
 def append(delta: dict, field, text: str) -> None:
-    if field in ("content", "refusal"):
+    if isinstance(field, str):
         delta[field] = (delta.get(field) or "") + text
         return
+    # join the entry with the same index if there is one, not every client merges two
     calls = delta.setdefault("tool_calls", [])
-    call = next((c for c in calls if c.get("index", 0) == field[1]), None)
-    if call is None:
-        call = {"index": field[1], "function": {}}
-        calls.append(call)
-    function = call.setdefault("function", {})
-    function["arguments"] = (function.get("arguments") or "") + text
+    for call in calls:
+        if isinstance(call, dict) and call.get("index", 0) == field[1] and isinstance(call.get("function"), dict):
+            call["function"]["arguments"] = (call["function"].get("arguments") or "") + text
+            return
+    calls.append({"index": field[1], "function": {"arguments": text}})
 
 
 async def redact_stream(lines: AsyncIterator[str]) -> AsyncIterator[str]:
