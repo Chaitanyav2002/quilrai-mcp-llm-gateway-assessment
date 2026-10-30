@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import time
 
 import httpx
@@ -7,7 +8,7 @@ import pytest
 
 from task4_model_router.app import create_app
 from task4_model_router.limiter import TokenRateLimiter
-from task4_model_router.router import PRIMARY_TIMEOUT, ModelRouter, Provider
+from task4_model_router.router import PRIMARY_TIMEOUT, ModelRouter, Provider, estimate_tokens
 
 BODY = {"model": "gpt-x", "max_tokens": 200, "messages": [{"role": "user", "content": "hello"}]}
 KEY = {"Authorization": "Bearer tenant-key-1"}
@@ -146,8 +147,9 @@ async def test_primary_side_errors_fall_back(make, status):
     assert response.headers["x-gateway-provider"] == "secondary"
 
 
-async def test_primary_rejecting_the_request_is_not_retried_elsewhere(make):
-    client, upstream, _ = make(lambda r: httpx.Response(400, json={"error": {"message": "unknown model gpt-x at /internal/v2"}}))
+@pytest.mark.parametrize("status", [400, 422])
+async def test_primary_rejecting_the_request_is_not_retried_elsewhere(make, status):
+    client, upstream, _ = make(lambda r: httpx.Response(status, json={"error": {"message": "unknown model gpt-x at /internal/v2"}}))
     response = await complete(client)
 
     is_gateway_error(response, 400, "upstream_rejected_request")
@@ -227,6 +229,14 @@ async def test_limit_is_per_api_key(make):
     ({**BODY, "max_tokens": True}, KEY, 400, "invalid_request"),
     ({**BODY, "stream": True}, KEY, 400, "invalid_request"),
     ({**BODY, "max_tokens": 60_000}, KEY, 400, "request_too_large"),
+    ({**BODY, "max_completion_tokens": 60_000}, KEY, 400, "request_too_large"),
+    ({**BODY, "n": 300}, KEY, 400, "request_too_large"),  # 300 answers of up to 200 tokens
+    ({**BODY, "n": 0}, KEY, 400, "invalid_request"),
+    ({**BODY, "max_completion_tokens": "5"}, KEY, 400, "invalid_request"),
+    ('{"messages": [], "temperature": NaN}', KEY, 400, "invalid_request"),
+    ('{"messages": [], "temperature": 1e999}', KEY, 400, "invalid_request"),
+    ('{"messages": [{"role": "user", "content": "\\ud800"}]}', KEY, 400, "invalid_request"),
+    ("[" * 200_000 + "]" * 200_000, KEY, 400, "invalid_request"),
 ])
 async def test_bad_requests_get_a_standard_error(make, body, headers, status, code):
     client, upstream, _ = make(lambda r: reply("primary"))
@@ -251,3 +261,41 @@ async def test_unexpected_failure_hides_internals(make, monkeypatch):
     error = is_gateway_error(response, 500, "internal_error")
     assert "/var/lib" not in response.text and "RuntimeError" not in response.text
     assert error["message"] == "Unexpected gateway error"
+
+
+def test_estimate_covers_every_answer_the_request_asks_for():
+    assert estimate_tokens({"messages": [], "n": 4, "max_tokens": 1000}) >= 4000
+    assert estimate_tokens({"messages": [], "max_completion_tokens": 3000}) >= 3000
+    assert estimate_tokens({"messages": [], "max_completion_tokens": 1, "max_tokens": 40_000}) >= 40_000
+
+
+def test_estimate_counts_other_scripts_at_about_one_token_per_character():
+    # not six, as escaped JSON would, and not under one, as UTF-8 bytes would
+    assert 30_000 <= estimate_tokens({"messages": [{"role": "user", "content": "你" * 30_000}], "max_tokens": 1}) < 31_000
+    assert estimate_tokens({"messages": [{"role": "user", "content": "你" * 66_000}], "max_tokens": 1}) > 50_000
+
+
+def test_estimate_counts_tools_and_everything_else_sent_to_the_model():
+    tools = [{"type": "function", "function": {"name": "f", "description": "x" * 800_000}}]
+    assert estimate_tokens({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "tools": tools}) > 190_000
+
+
+def locked(*args):
+    raise sqlite3.OperationalError("database is locked")
+
+
+async def test_answer_is_returned_even_if_recording_usage_fails(make, monkeypatch):
+    client, _, limiter = make(lambda r: reply("primary"))
+    monkeypatch.setattr(limiter, "settle", locked)
+    response = await complete(client)
+
+    assert response.status_code == 200
+    assert response.headers["x-gateway-provider"] == "primary"
+
+
+async def test_failed_refund_does_not_hide_the_real_error(make, monkeypatch):
+    client, _, limiter = make(lambda r: httpx.Response(500), secondary=lambda r: httpx.Response(500))
+    monkeypatch.setattr(limiter, "release", locked)
+    response = await complete(client)
+
+    is_gateway_error(response, 503, "providers_unavailable")

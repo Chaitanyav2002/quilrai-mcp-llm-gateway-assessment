@@ -35,9 +35,14 @@ class Failover(Exception):
 
 
 def estimate_tokens(body: dict) -> int:
-    # roughly 4 characters per token, plus the most the model is allowed to write
-    prompt = len(json.dumps(body["messages"])) // 4
-    return prompt + (body.get("max_tokens") or DEFAULT_MAX_TOKENS)
+    # everything sent counts, tools too: about 4 English characters per token, other scripts about 1 per character.
+    # Plus the most the model may write for each of the n answers.
+    text = json.dumps(body, ensure_ascii=False)
+    ascii_chars = len(text.encode("ascii", "ignore"))
+    prompt = ascii_chars // 4 + len(text) - ascii_chars
+    # the larger limit, a provider may honour either one
+    output = max(body.get("max_completion_tokens") or 0, body.get("max_tokens") or 0) or DEFAULT_MAX_TOKENS
+    return prompt + output * (body.get("n") or 1)
 
 
 class ModelRouter:
@@ -59,14 +64,21 @@ class ModelRouter:
         try:
             data, name = await self._first_answer(body)
         except BaseException:
-            await asyncio.to_thread(self.limiter.release, reservation)
+            await self._quietly(self.limiter.release, reservation)
             raise
 
         usage = data.get("usage")
         used = usage.get("total_tokens") if isinstance(usage, dict) else None
         if type(used) is int and used >= 0:
-            await asyncio.to_thread(self.limiter.settle, reservation, used)
+            await self._quietly(self.limiter.settle, reservation, used)
         return data, name
+
+    async def _quietly(self, action, *args) -> None:
+        # a database hiccup here must not cost the client an answer it already has, or hide the real error
+        try:
+            await asyncio.to_thread(action, *args)
+        except Exception:
+            log.exception("could not %s reservation %s", action.__name__, args[0])
 
     async def _first_answer(self, body: dict) -> tuple[dict, str]:
         for provider in self.providers:

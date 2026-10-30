@@ -212,6 +212,26 @@ async def test_unreadable_lines_get_a_json_rpc_error_and_the_session_survives(se
     assert "result" in await session.request("ping")
 
 
+@pytest.mark.parametrize("line", [
+    '{"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": "x"}',
+    '{"jsonrpc": "2.0", "id": "req-8", "method": 5}',
+])
+async def test_malformed_request_with_a_readable_id_gets_that_id_back(session, line):
+    await session.send(line)
+    reply = await session.next_message()
+
+    assert reply["id"] == json.loads(line)["id"]  # otherwise the client waits for an answer forever
+    assert error_code(reply) == -32600
+
+
+async def test_malformed_response_is_not_answered_with_its_id(session):
+    # id 3 here belongs to a request the server made, echoing it would fail the client's own request 3
+    await session.send('{"jsonrpc": "2.0", "id": 3, "result": "oops"}')
+    reply = await session.next_message()
+
+    assert reply["id"] is None
+
+
 async def test_missing_arguments_object_is_rejected(session):
     reply = await session.call_tool("trigger_refund", None)
 

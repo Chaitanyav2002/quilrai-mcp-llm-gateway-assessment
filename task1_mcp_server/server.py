@@ -167,10 +167,22 @@ class AnswerUnreadableLines:
 
 
 def unreadable_line_reply(exc: Exception) -> types.JSONRPCError:
-    not_json = isinstance(exc, ValidationError) and any(e["type"] == "json_invalid" for e in exc.errors())
+    errors = exc.errors() if isinstance(exc, ValidationError) else []
+    not_json = any(e["type"] == "json_invalid" for e in errors)
     code, message = (PARSE_ERROR, "Parse error") if not_json else (INVALID_REQUEST, "Invalid Request")
     log.warning("unreadable line on stdin, answered %s", code)
-    return types.JSONRPCError(jsonrpc="2.0", id=None, error=types.ErrorData(code=code, message=message))
+    return types.JSONRPCError(jsonrpc="2.0", id=readable_id(errors), error=types.ErrorData(code=code, message=message))
+
+
+def readable_id(errors: list) -> str | int | None:
+    # "missing field" errors carry the whole message, so a broken request can still get its id back.
+    # Requests only: a reply to one of our own requests must not be answered.
+    for err in errors:
+        message = err.get("input")
+        if len(err["loc"]) <= 2 and isinstance(message, dict) and "method" in message \
+                and type(message.get("id")) in (str, int):
+            return message["id"]
+    return None
 
 
 async def main() -> None:

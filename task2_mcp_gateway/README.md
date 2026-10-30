@@ -20,17 +20,17 @@ curl -s localhost:9000/mcp -H "Authorization: Bearer $VIEWER" -H "Content-Type: 
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"admin_reset_key","arguments":{}}}'
 # {"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"Unauthorized Tool Call"}}
 
-pytest task2_mcp_gateway -q    # 48 tests
+pytest task2_mcp_gateway -q    # 49 tests
 ```
 
 ## What happens to a request
 
-1. **Auth.** The token must be an HS256 JWT signed with our secret, with `exp` and a `role` of `admin` or `viewer`. Otherwise the caller gets HTTP 401 and nothing else.
-2. **Parse.** The body must be under 1 MB, valid JSON with no duplicate keys, and a single JSON-RPC 2.0 message. Otherwise: 413, or 400 with `-32700` / `-32600`.
-3. **Authorize.** A `tools/call` whose `params.name` starts with `admin_` needs the admin role. Anyone else gets `-32001 Unauthorized Tool Call` with their request `id`.
-4. **Forward.** Everything else, `tools/list` included, goes to the MCP server unchanged, and the reply (JSON or SSE) is streamed back. If the server is down: 502, or 504 on a timeout.
+1. Check the token. It must be an HS256 JWT signed with our secret, with `exp` and a `role` of `admin` or `viewer`. Otherwise the caller gets HTTP 401 and nothing else.
+2. Parse the body. It must be under 1 MB, valid JSON with no duplicate keys, and a single JSON-RPC 2.0 message. Otherwise: 413, or 400 with `-32700` / `-32600`.
+3. Check the tool. A `tools/call` whose `params.name` starts with `admin_` needs the admin role. Anyone else gets `-32001 Unauthorized Tool Call` with their request `id`.
+4. Forward. Everything else, `tools/list` included, goes to the MCP server unchanged, and the reply (JSON or SSE) is streamed back. If the server is down: 502, or 504 on a timeout.
 
-Auth comes first so an unauthenticated caller learns nothing about the tools.
+The token is checked first, so a caller without a valid one learns nothing about the tools.
 
 ## Decisions
 
@@ -41,7 +41,7 @@ Auth comes first so an unauthenticated caller learns nothing about the tools.
   - A `tools/call` without a readable string name (`-32602`), since there's no way to authorize it.
   - A `tools/call` with no `id`.
   - JSON-RPC batches. MCP dropped them in the 2025-06-18 spec, and an admin call could hide inside one.
-  - Duplicate keys. The gateway forwards the original bytes, and Python keeps the last duplicate while some parsers keep the first, so `{"name":"admin_reset_key","name":"get_weather"}` would pass the check here and run the admin tool downstream. The code review found this.
+  - Duplicate keys. The gateway forwards the original bytes, and Python keeps the last duplicate while some parsers keep the first, so `{"name":"admin_reset_key","name":"get_weather"}` would pass the check here and run the admin tool downstream.
 - The user's token is not forwarded. Passing it on would let the MCP server replay it somewhere else. In production the gateway would use its own credential with the server.
 - MCP headers such as `Mcp-Session-Id` pass through both ways. `GET` (the notification stream) and `DELETE` (end session) are forwarded after auth, and the `GET` stream has no read timeout because it can be idle for minutes.
 - Every forwarded call and every denial is logged with the token's `sub` and role. The token itself is never logged.
@@ -59,3 +59,6 @@ Auth comes first so an unauthenticated caller learns nothing about the tools.
 
 - `tools/list` is not filtered, because the task says to forward it as is. Hiding admin tools from viewers would be an easy addition, but the check on calls is what actually protects them.
 - Issuing tokens. A real setup would use an identity provider and RS256 keys instead of a shared secret.
+- Session ids aren't tied to the user who opened them. The gateway would need to remember which `sub` created each `Mcp-Session-Id` and check it on later requests.
+- Open `GET` streams share the connection pool with tool calls, so one user holding many of them could slow everyone down. Production would give streams their own pool and a per-user cap.
+- A tool that runs for over 60 s without sending progress events gets its SSE reply cut off, with no JSON-RPC error at the end.

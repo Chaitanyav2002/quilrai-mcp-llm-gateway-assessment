@@ -240,3 +240,30 @@ async def test_provider_down_is_a_502():
         response = await client.post("/v1/chat/completions", json=REQUEST)
 
     assert response.status_code == 502
+
+
+async def test_broken_provider_stream_ends_with_a_clean_error():
+    def handler(request):
+        body = 'data: {"choices": [{"index": 0, "delta": {"content": "Hello"}}]}\n\ndata: {not json\n\n'
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    async with gateway_with(handler) as client:
+        response = await client.post("/v1/chat/completions", json=REQUEST)
+
+    events = events_from(response.text.splitlines())
+    assert json.loads(events[-1]) == {"error": {"message": "Upstream stream failed", "type": "upstream_error"}}
+    assert "Expecting" not in response.text  # the parser's own message stays in our logs
+
+
+@pytest.mark.parametrize("raw", [
+    '{"stream": true, "temperature": NaN, "messages": []}',
+    '{"stream": true, "temperature": 1e999, "messages": []}',                     # parses as infinity
+    '{"stream": true, "messages": [{"role": "user", "content": "\\ud800"}]}',    # lone surrogate, not UTF-8
+    "[" * 200_000 + "]" * 200_000,
+])
+async def test_body_the_provider_could_not_take_is_a_400(raw):
+    async with gateway_with(lambda r: httpx.Response(200)) as client:
+        response = await client.post("/v1/chat/completions", content=raw, headers={"Content-Type": "application/json"})
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request"

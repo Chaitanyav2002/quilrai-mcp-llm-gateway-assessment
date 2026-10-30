@@ -9,7 +9,7 @@ An MCP server over stdio, built on the official Python SDK (`mcp` 2.3.0), with t
 
 ```bash
 python -m task1_mcp_server.server     # JSON-RPC on stdin/stdout
-pytest task1_mcp_server -q            # 43 tests, most run the real server process
+pytest task1_mcp_server -q            # 46 tests, most run the real server process
 ```
 
 To use it from an MCP client, add it to the client's server config:
@@ -25,7 +25,7 @@ To use it from an MCP client, add it to the client's server config:
 | Bad arguments (wrong id format, `0`, `0.001`, `"25"`, `true`, `Infinity`, short reason, extra or missing field) | `-32602`, with a list of the bad fields. The rejected values are not echoed back. |
 | Unknown tool | `-32602`, which is what the MCP spec uses |
 | A line that is not JSON | `-32700`, `id: null` |
-| JSON that is not a JSON-RPC message | `-32600`, `id: null` |
+| JSON that is not a valid JSON-RPC message | `-32600`, with the request's `id` if it can be read, otherwise `id: null` |
 | Valid call, but the customer does not exist | Normal result with `isError: true`, so the model can read it |
 
 ## Notes

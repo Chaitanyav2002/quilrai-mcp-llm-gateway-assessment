@@ -17,7 +17,7 @@ curl -si localhost:9200/v1/chat/completions -H "Authorization: Bearer tenant-a" 
   -H "Content-Type: application/json" -d '{"max_tokens":200,"messages":[{"role":"user","content":"hi"}]}'
 # HTTP 200 after about 3 s, X-Gateway-Provider: secondary
 
-pytest task4_model_router -q    # 44 tests
+pytest task4_model_router -q    # 58 tests
 ```
 
 | File | Job |
@@ -32,10 +32,10 @@ Only keys listed in `TENANT_API_KEYS` are accepted. Without that list, any new s
 
 Each request is one row in `usage(tenant, ts, tokens)`. The tenant is a SHA-256 of the API key, so raw keys are never written to disk.
 
-1. **Reserve** before calling a model. The estimate is the prompt size (about 4 characters per token) plus `max_tokens` (1024 if not set), which is the most the request can cost.
+1. Reserve tokens before calling a model. The estimate is the size of the whole body, tools included (about 4 characters per token for English, 1 per character for other scripts) plus `max_completion_tokens` or `max_tokens` (1024 if neither is set) for each of the `n` answers. When the client sets a limit, that is the most the request can cost.
 2. In one `BEGIN IMMEDIATE` transaction: delete rows older than 60 s, add up the tenant's remaining tokens, and insert the new row only if it fits. If it doesn't, return 429 with a `Retry-After` that says when enough old usage will have dropped out.
-3. **Settle** when the model answers: the row is updated to the real `usage.total_tokens`, so a request that reserved 1,224 tokens but used 20 gives the rest back right away.
-4. **Release** the row if both providers fail, so the tenant isn't charged for an outage.
+3. Settle when the model answers: the row is updated to the real `usage.total_tokens`, so a request that reserved 1,224 tokens but used 20 gives the rest back right away.
+4. Release the row if both providers fail, so the tenant isn't charged for an outage.
 
 `BEGIN IMMEDIATE` takes the write lock before the read, so two requests can't both see "45,000 used" and both add 5,000. The lock is in the database file, which means this also works with several gateway processes sharing it. The test fires 40 requests of 5k from 16 threads through 4 separate limiters, and exactly 10 get through.
 
@@ -71,14 +71,16 @@ Upstream error bodies, tracebacks and exception text never reach the client. The
 
 - The window itself: sliding, expired rows actually deleted, correct `Retry-After`, settle, release, separate tenants, surviving a restart, no raw keys on disk.
 - No overshoot when many threads reserve at once.
-- Fallback on 429, timeout, 5xx, 401/403/404, connection errors and bad replies, and no fallback on 400.
+- Fallback on 429, timeout, 5xx, 401/403/404, connection errors and bad replies, and no fallback on 400 or 422.
 - A slow primary really is cancelled at the deadline, and 10 concurrent requests time out together rather than one after another.
-- Every error has the standard shape, and fake tracebacks and internal paths from upstream never show up in it.
+- Every error has the standard shape, and fake tracebacks and internal paths from upstream never show up in it. Bodies with `NaN`, `1e999`, very deep nesting or a bad `n` get a 400, not a 500.
+- If the database fails after the model has answered, the client still gets the answer, and a failed refund doesn't hide the real error.
 - I broke the code on purpose (no transaction, no eviction, no refund, no settle, no timeout, falling back on every error, leaking upstream text), and each change failed a test. A deferred `BEGIN` happened to pass, but only because the first statement is a write. `IMMEDIATE` keeps it safe if someone reorders the statements.
 
 ## Not included
 
-- Tokens are estimated at about 4 characters each. A real setup would use the model's tokenizer. Recording the provider's real usage keeps the window accurate either way.
-- A request can still go over after the fact if the model writes more than estimated. The extra counts against the next minute.
+- Tokens are estimated from the body size, at about 4 English characters or 1 character of other scripts each. A real setup would use the model's tokenizer. Recording the provider's real usage keeps the window accurate either way.
+- If the client sets no output limit, the model can write more than the 1024 tokens assumed. Real usage is still recorded, so the extra counts against the next minute.
+- The 3 s deadline includes waiting for a free connection. With more than 100 requests in flight, a full connection pool can look like a slow primary. A bigger pool per provider would fix that.
 - Non-streaming only. A streaming version would record usage when the final usage chunk arrives.
 - No circuit breaker. After many primary failures, a breaker would go straight to the backup instead of waiting 3 s each time.

@@ -54,13 +54,16 @@ async def read_body(request: Request) -> dict:
             raise GatewayError(413, "request_too_large", "Request body is over 1 MB")
     try:
         body = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        # NaN, 1e999 and lone surrogates parse here but can't be sent on, so check like httpx will
+        json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+    except (ValueError, RecursionError):
         raise invalid("Request body must be JSON") from None
     if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
         raise invalid("Request must be a JSON object with a messages list")
-    max_tokens = body.get("max_tokens")
-    if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 1):
-        raise invalid("max_tokens must be a positive integer")
+    for field in ("max_tokens", "max_completion_tokens", "n"):
+        value = body.get(field)
+        if value is not None and (type(value) is not int or value < 1):
+            raise invalid(f"{field} must be a positive integer")
     if body.get("stream"):
         raise invalid("Streaming is not supported on this endpoint")
     return body

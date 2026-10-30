@@ -131,13 +131,15 @@ def create_app(provider_url: str, api_key: str, http_client: httpx.AsyncClient |
                 return error(413, "Request body too large")
         try:
             body = json.loads(raw)
-        except ValueError:
+            # NaN, 1e999 and lone surrogates parse here but can't be sent on
+            payload = json.dumps(body, ensure_ascii=False, allow_nan=False).encode()
+        except (ValueError, RecursionError):
             return error(400, "Request body must be JSON")
         if not isinstance(body, dict) or body.get("stream") is not True:
             return error(400, 'This endpoint streams only, send "stream": true')
 
-        upstream_request = client.build_request(
-            "POST", provider_url, json=body, headers={"Authorization": f"Bearer {api_key}"})
+        upstream_request = client.build_request("POST", provider_url, content=payload, headers={
+            "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
         try:
             upstream = await client.send(upstream_request, stream=True)
         except httpx.TimeoutException:

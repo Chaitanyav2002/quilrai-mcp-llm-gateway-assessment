@@ -159,7 +159,7 @@ def create_app(downstream_url: str, jwt_secret: str, http_client: httpx.AsyncCli
             message = json.loads(body, object_pairs_hook=reject_duplicate_keys)
         except DuplicateKey:
             return json_rpc_error(None, INVALID_REQUEST, "Invalid Request: duplicate keys", status=400)
-        except ValueError:
+        except (ValueError, RecursionError):
             return json_rpc_error(None, PARSE_ERROR, "Parse error", status=400)
 
         if problem := envelope_problem(message):

@@ -1,6 +1,6 @@
 # AI Field Developer assessment
 
-Four tasks on MCP servers, MCP and LLM gateways, stream guardrails and model routing. All in Python (3.11 or newer for `asyncio.timeout`; developed and tested on 3.14), each in its own folder with a README covering how to run it, the design decisions and what the tests prove.
+Four tasks on MCP servers, MCP and LLM gateways, stream guardrails and model routing. All in Python (3.11 or newer for `asyncio.timeout`; developed and tested on 3.14), each in its own folder with a README covering how to run it, the design decisions and what the tests check.
 
 | Task | Folder | Summary |
 |---|---|---|
@@ -14,7 +14,7 @@ Four tasks on MCP servers, MCP and LLM gateways, stream guardrails and model rou
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q          # 194 tests across all four tasks
+pytest -q          # 257 tests across all four tasks
 ```
 
 Each task folder shows how to run its servers by hand. Configuration comes from environment variables; see [`.env.example`](.env.example). No secrets are stored in the repo.
